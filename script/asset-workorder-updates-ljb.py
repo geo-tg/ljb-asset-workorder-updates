@@ -721,8 +721,8 @@ if __name__ == "__main__":
     except Exception: 
         logging.error("EXCEPTION OCCURRED", exc_info=True)
 
-        error_to = 'wfrancois@ljbinc.com'
-        error_from = 'WorkFlow@ljbinc.com'
+        error_to = 'user@domain.com'
+        error_from = 'user@domain.com'
         error_sub = 'FAILED asset-workorder-updates-ljb.py'
         error_msg = 'asset-workorder-updates-ljb.py failed. Log file is attached. Please review and contact GTG if necessary (sstokes@geotg.com or jrogers@geotg.com)'
         printLog("Sending log to owners...")
