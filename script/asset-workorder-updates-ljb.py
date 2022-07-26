@@ -5,16 +5,15 @@ _______________________________________________________________________________
 _______________________________________________________________________________
 
    Program:     asset-workorder-updates-ljb.py
-   Purpose:     1. Grab the WWS Asset and Work Order feature layers 
-                and build the Asset, OP Work Order, and PE Work Order 
-                dictionaries. 
+   Purpose:     1. Grab the Work Order feature layers 
+                and build the Asset, Work Order dictionaries. 
                 2. For both the OP and PE assets:
-                    2a. If a next due date exists in the Asset, a related Work 
+                    2a. If a next-inspection date exists in the Asset, a related Work 
                     Order does not exist, and the due date is within 40/375 
                     days (operator/PE):
                         - Create a new work order, with attachment
                         - Add the inspection to the Upcoming Excel worksheet
-                    2b. If a next due date exists in the Asset, a related Work 
+                    2b. If a next-inspection date exists in the Asset, a related Work 
                     Order does exist, and the inspection is complete:
                         - Add the inspection to the Completed Excel worksheet
                         - Update the Last and Next inspection date fields in 
@@ -26,7 +25,7 @@ _______________________________________________________________________________
                             worksheet
                             - Update the Last and Next inspection date fields 
                             in the Assets
-                    2c. If a next due date exists in the Asset, a related Work 
+                    2c. If a next-inspection date exists in the Asset, a related Work 
                     Order does exist, and the inspection is not complete:
                         - Compare the due date to the current date and determine 
                         if the inspection is overdue. 
@@ -44,16 +43,18 @@ _______________________________________________________________________________
                 6. Send email with Excel workbook attached to client and LJB.
 _______________________________________________________________________________
    History:     GTG     06/2021    Created
-                GTG     12/2021    Update process... see above for 
-                                    full summary. LJB migrated away 
+                GTG     12/2021    Update process... LJB migrated away 
                                     from Workforce to a custom feature
                                     service and applications.
+                GTG     07/2022    Updated process. See above for updated summary.
+                                    Used permanent work order 
+                                    points and distinct asset feature classes.
 _______________________________________________________________________________
 '''
-
+#%%
 from arcgis.gis import GIS
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import logging
 import os
@@ -69,12 +70,12 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
+
 def printLog(words):
     '''Prints and logs progress/errors/exceptions'''
 
     logging.info(words)
     print(words)
-
 
 def sendemail(eto, efrom, subject, message, email_cc, att = ''):
     '''Sends email to client and to LJB with the
@@ -108,7 +109,6 @@ def sendemail(eto, efrom, subject, message, email_cc, att = ''):
     connection.send_message(mimemsg)
     connection.quit()
 
-
 def createWorkbook(output_dir):
     ''' Creates Excel workbook Completed, Upcoming
     and Overdue assignments. '''
@@ -121,7 +121,6 @@ def createWorkbook(output_dir):
 
     return(workbook, wb_path)
 
-
 def addWorksheet(wb, worksheet_info):
     '''Adds worksheet and data to supplied Excel workbook'''
 
@@ -130,14 +129,11 @@ def addWorksheet(wb, worksheet_info):
         values = ws_info[0]
         cols = ws_info[1]
 
-        printLog('Adding worksheet {}...'.format(sheetname))
         sheet = wb.add_worksheet(sheetname)
 
-        printLog('Populating columns...')
         for c in cols:
             sheet.write(c[0], c[1])
 
-        printLog('Populating rows...')
         row = 1
         for v in values.values():
             row += 1
@@ -148,533 +144,432 @@ def addWorksheet(wb, worksheet_info):
 
     return(wb, sheet)
 
-
-def buildQueryDictionaries(portal, un, pw, item_id, asset_index, wo_index):
+def buildQueryDictionaries(orgURL, username, password, itemID, \
+                            wo_table_index, wo_index, crane_index, 
+                            forktruck_index, eyewash_index, fire_index):
+    
     '''Builds dictionaries to be used for asset and work order updates 
     in the updateServices module.Asset dictionary is populated if a next 
     due date value exists.
     Work Order dictionaries are populated if work order due date matches 
     match the due date in the assets'''
 
-    gis = GIS(portal, un, pw)
+    gis = GIS(orgURL, username, password)
     printLog('Connected to Portal as {}'.format(gis.properties['user']['username']))
 
-    sdi_item = gis.content.get(item_id)
-    assets_lyr = sdi_item.layers[asset_index]
+    sdi_item = gis.content.get(itemID)
+    work_orders_tbl = sdi_item.tables[wo_table_index]
     work_orders_lyr = sdi_item.layers[wo_index]
+    crane_lyr = sdi_item.layers[crane_index]
+    forktruck_lyr = sdi_item.layers[forktruck_index]
+    eyewash_lyr = sdi_item.layers[eyewash_index]
+    fire_lyr = sdi_item.layers[fire_index]
 
     printLog('Building queried feature layers...')
-    assets_feat = assets_lyr.query()
-    op_work_orders_feat = work_orders_lyr.query("AssignmentType IN ('WWS Operator Inspection', 'Crane Operator Inspection')")
-    pe_work_orders_feat = work_orders_lyr.query("AssignmentType = 'PE Inspection'")
+    work_orders_tbl_feat= work_orders_tbl.query()
+    work_orders_feat = work_orders_lyr.query()
+    crane_feat = crane_lyr.query()
+    forktruck_feat = forktruck_lyr.query()
+    eyewash_feat = eyewash_lyr.query()
+    fire_feat = fire_lyr.query()
 
-    asset_dict = {} #HazardID: [type-0, area-1, location-2, description-3, description notes-4, 
-        #                       production accessible-5, OP frequency-6, Next OP inspection-7, 
-        #                       Last OP inspection-8, PE frequency-9, next PE inspection-10, 
-        #                       last PE inspection-11, oid-12, geometry-13]
+    asset_lyrs = [crane_lyr, fire_lyr, eyewash_lyr, forktruck_lyr]
+    asset_list = [crane_feat, fire_feat, eyewash_feat, forktruck_feat]
+    asset_dict = {} 
+
     printLog('Building asset features dictionary...')
-    for a in assets_feat.features:
-        # only add assets to dictionary if a due date has been set for either OP or PE
-        if a.attributes['NextOpInspect'] != None or a.attributes['NextPEInspect'] != None:
-            if a.attributes['HazardID'] != None:
-                asset_dict[a.attributes['HazardID']] = [
-                    a.attributes['OperatorType'],
-                    a.attributes['AssetArea'],
-                    a.attributes['AssetLocation'],
-                    a.attributes['AssetDescription'],
-                    a.attributes['AssetDescriptionNotes'],
-                    a.attributes['ProductionAccessible'],
-                    a.attributes['OperatorFrequency'],
-                    a.attributes['NextOpInspect'],
-                    a.attributes['LastOpInspect'],
-                    a.attributes['PEFrequency'],
-                    a.attributes['NextPEInspect'],
-                    a.attributes['InspectDate'],
-                    a.attributes['OBJECTID'],
-                    a.geometry]
-            else:
-                printLog('Asset ObjectID {} is mising an Asset ID (Hazard ID)!!'.format(a.attributes['OBJECTID']))
+    for asset_feat in asset_list:
+        for a in asset_feat.features:
+            # only add assets to dictionary if a 'NextInspection' has been set and has an 'AssetID'
+            asset_id_fieldname = [k for k,v in a.attributes.items() if "assetid" in k.lower()][0]
+            if a.attributes['NextInspection'] != None:
+                if a.attributes[asset_id_fieldname] != None:
+                    asset_dict[a.attributes[asset_id_fieldname]] = [
+                        a.attributes['EquipType'],
+                        a.attributes['MeltShopArea'],
+                        a.attributes['Building'],
+                        a.attributes['InspectNotes'],
+                        a.attributes['InspectName'],
+                        a.attributes['NextInspection'],
+                        a.attributes['LastInspect'],
+                        a.attributes['InspectInterval'],
+                        a.attributes['Clock'],
+                        a.attributes['OBJECTID'],
+                        a.attributes['GlobalID'],
+                        a.geometry]
+                else:
+                    printLog('Asset with Global ID {} is missing an Asset ID!!'.format(a.attributes['GlobalID']))
 
-    op_work_order_dict = {} # HazardID: [type-0, complete date-1, assigned to-2, due date-3, status-4, oid-5, geom-6]
-    printLog('Building OP work order features dictionary...')
-    for o in op_work_orders_feat.features:
-        # only add work orders to dictionary where AssignmentDueDate == NextOpInspect from WWS Assets
-        # this avoids adding older completed work orders and overwriting the hazard id key
-        hazard_id_wo = o.attributes['HazardID']
-        if hazard_id_wo in asset_dict.keys():
-            if o.attributes['AssignmentDueDate'] == asset_dict[hazard_id_wo][7]:
-                op_work_order_dict[hazard_id_wo] = [
-                    o.attributes['AssignmentType'],
-                    o.attributes['CompleteDate'],
-                    o.attributes['username'],
-                    o.attributes['AssignmentDueDate'],
-                    o.attributes['AssignmentStatus'],
-                    o.attributes['OBJECTID'],
-                    o.geometry]
+    wo_table_dict = {} 
+    printLog('Building work order table dictionary...')
+    for o in work_orders_tbl_feat.features:
+        wo_table_dict[o.attributes['GlobalID']] = [
+            o.attributes['username'],
+            o.attributes['AssignmentStatus'],
+            o.attributes['AssignmentType'],
+            o.attributes['AssignmentDueDate'],
+            o.attributes['LastInspect'],
+            o.attributes['RELAssetID'],
+            o.attributes['created_date'],
+            o.attributes['OBJECTID'],
+            o.geometry]
 
-    pe_work_order_dict = {} # HazardID: [type-0, complete date-1, assigned to-2, due date-3, status-4, oid-5, geom-6]
-    printLog('Building PE work order features dictionary...')
-    for p in pe_work_orders_feat.features:
-        # only add work orders to dictionary where AssignmentDueDate == NextOpInspect from WWS Assets
-        # this avoids adding older completed work orders and overwriting the hazard id key
-        hazard_id_wo = p.attributes['HazardID']
-        if hazard_id_wo in asset_dict.keys():
-            if p.attributes['AssignmentDueDate'] == asset_dict[p.attributes['HazardID']][7]:
-                pe_work_order_dict[p.attributes['HazardID']] = [
-                    p.attributes['AssignmentType'],
-                    p.attributes['CompleteDate'],
-                    p.attributes['username'],
-                    p.attributes['AssignmentDueDate'],
-                    p.attributes['AssignmentStatus'],
-                    p.attributes['OBJECTID'],
-                    p.geometry]
+    work_orders_dict = {} 
+    printLog('Building work order features dictionary...')
+    for o in work_orders_feat.features:
+        if o.attributes['RELAssetID'] in asset_dict.keys():
+            work_orders_dict[o.attributes['RELAssetID']] = [
+                o.attributes['AssignmentType'],
+                o.attributes['username'],
+                o.attributes['AssignmentDueDate'],
+                o.attributes['AssignmentStatus'],
+                o.attributes['LastInspect'],
+                o.attributes['created_date'],
+                o.attributes['GlobalID'],
+                o.attributes['OBJECTID'],
+                o.geometry]
 
-    return(assets_lyr, work_orders_lyr, asset_dict, op_work_order_dict, pe_work_order_dict)
-
-
-def updateServices(assets, work_orders, asset_dict, op_work_order_dict, pe_work_order_dict, today):
+    return(asset_lyrs, asset_list, work_orders_lyr, work_orders_tbl, asset_dict, wo_table_dict, work_orders_dict)
+#%%
+def updateServices(asset_lyrs, asset_list, work_orders_lyr, work_orders_tbl, asset_dict, wo_table_dict, work_orders_dict, today):
+    
     '''Creates new work orders, updates status of overdue work orders, 
     and updates the last and next inspection dates of OP and PE assets.
     Outputs 6 dictionaries that are used to populate an Excel Workbook.'''
 
-    # get completed, upcoming, and overdue tasks
-    op_overdue = {} # hazard id : [orig due date, days overdue, area, location, desc, notes, freq, last inspect date, hazard id, prod acc, type]
-    op_upcoming = {} # hazard id : [area, location, desc, notes, due date, freq, last inspect date, hazard id, prod acc, type]
-    op_completed = {} # hazard id : [area, location, desc, notes, complete date, worker, hazard id, prod acc, type]
+    # Asset Types
+    asset_name_dict = {
+        'Crane': 0,
+        'Extinguisher': 1,
+        'Eyewash': 2,
+        'Forklift': 3
+    }
 
-    pe_overdue = {} # hazard id : [orig due date, days overdue, area, location, desc, notes, freq, last inspect date, prod acc]
-    pe_upcoming = {} # hazard id : [area, location, desc, notes, due date, freq, last inspect date, prod acc]
-    pe_completed = {} # hazard id : [area, location, desc, notes, complete date, worker, prod acc]
+    # Inspection Intervals
+    insp_interval_dict = {
+        'Daily': 86400000,
+        'Shift Start': 43200000,
+        'Weekly': 604800000,
+        'Monthly': 2678400000,
+        'End of Month': 2419200000
+    }
 
-    op_type_dict = {'Operator': ['WWS Operator Inspection', 'Operator Contractor'], 'Crane': ['Crane Operator Inspection', 'Crane Crew']}
+    wb_overdue = {}
+    wb_upcoming = {}
+    wb_completed = {}
 
+    crane_overdue = {} 
+    crane_upcoming = {} 
+    crane_completed = {}
+    fire_overdue = {} 
+    fire_upcoming = {}
+    fire_completed = {}
+    eyewash_overdue = {} 
+    eyewash_upcoming = {}
+    eyewash_completed = {}
+    forktruck_overdue = {}
+    forktruck_upcoming = {} 
+    forktruck_completed = {} 
+
+    
     printLog('Looping all assets with a due date...')
-    for k, v in asset_dict.items():
+    # ---------------------------------------------------------------------------------------------------------------------------
+    # get unique asset IDs in work order table
+    wo_table_dict_assetids = []
+    for k, v in wo_table_dict.items():
+        if v[5] not in wo_table_dict_assetids:
+            wo_table_dict_assetids.append(v[5])
 
+    for k, v in asset_dict.items():
         # identify variables 
-        hazard_id = k
-        op_type, area, location, desc, notes, prod_acc, op_freq, op_next_insp, \
-        op_last_insp, pe_freq, pe_next_insp, pe_last_insp, obj_id, geom = v
+        asset_id = k
+        asset_type, area, building, notes, insp_name, next_insp, last_insp, insp_interval, insp_clock, obj_id, global_id, geom = v
+
+        # Reverse lookup asset by 'EquipType'          
+        asset_lyr = asset_lyrs[asset_name_dict[asset_type]]
 
         print('Asset ID {}'.format(str(k)))
 
-        # OPERATOR
-        if op_next_insp != None:
-            if hazard_id not in op_work_order_dict.keys():
-                print('Due date set and no work order is scheduled')
-                duedate = datetime.fromtimestamp(op_next_insp/1000)
+        if next_insp != None:
+            # due date is set
 
-                # if the due date within a month's time (~ 40 days), create workorder and record as upcoming
+            # format date fields for Excel
+            next_insp_date = datetime.fromtimestamp(next_insp/1000)
+            next_insp_format = next_insp_date.strftime("%Y-%m-%d %H:%M:%S")
+            last_insp_format = datetime.fromtimestamp(last_insp/1000).strftime("%Y-%m-%d %H:%M:%S") if last_insp != None else "No previous inspection"
+
+            if asset_id not in work_orders_dict:
+                # due date set and no work order found
+
+                print('Due date set but no work order point exists')
+                # if the due date within a month's time (~ 40 days), record as upcoming, else overdue
                 print('Calculating days till due...')
-                days_till_due = (today - duedate).days
-
-                if days_till_due <= 40:
-                    print('Creating new OP work order...')
-
+                days_till_due = ((next_insp_date-today).days) + 1
+                if days_till_due <= 60 and days_till_due >= 0:
                     # record work order as upcoming in Excel
-                    duedate_format = duedate.strftime("%Y-%m-%d %H:%M:%S")
-                    if op_last_insp != None:
-                        last_insp_format = (datetime.fromtimestamp(op_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        last_insp_format = 'No previous inspection'
                     print('Adding to upcoming dictionary...')
-                    op_upcoming[hazard_id] = [area, location, desc, notes, duedate_format, op_freq, last_insp_format,
-                                                hazard_id, prod_acc, op_type]
+                    wb_upcoming[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, last_insp_format, insp_interval, asset_id]
 
-                    # create work order as Assigned
-                    add_dict = {'geometry': geom, 
-                                'attributes': {'username': op_type_dict[op_type][1],
-                                                'AssignmentStatus': 'Assigned',
-                                                'AssignmentType': op_type_dict[op_type][0],
-                                                'AssignmentDueDate': op_next_insp,
-                                                'AssetArea': area, 
-                                                'AssetLocation': location,
-                                                'AssetDescription': desc,
-                                                'AssetDescriptionNotes': notes,
-                                                'HazardID': hazard_id}}
+                elif days_till_due < 0:
+                    # record work order as overdue in Excel
+                    days_overdue = abs(days_till_due)
+                    print('Adding to overdue dictionary...')
+                    wb_overdue[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, days_overdue, last_insp_format, insp_interval, asset_id] 
+                                    
+            elif asset_id in work_orders_dict:
+                # due date set and a work order point exists
 
-                    # create new work order with same geometry as asset
-                    try:      
-                        print('Adding new OP work order...Hazard ID {}'.format(hazard_id))
-                        work_orders.edit_features(adds = [add_dict])
-                    except Exception as e:
-                        print('Failed to add new work order for Hazard ID {}'.format(str(hazard_id)))
-                        print(e)
-                    # adds_l.append(add_dict)
+                if asset_id in wo_table_dict_assetids:
+                    # due date set, work order point exists, and work order table row exists
 
-                    # add attachments
-                    new_work_order = work_orders.query('HazardID = {}'.format(hazard_id)).features[0]
-                    new_oid = new_work_order.attributes['OBJECTID']
+                    # Grab most recent work order table row for asset
+                    most_recent_wo_globalid = ''
+                    latest_date = 0
+                    for k, v in wo_table_dict.items():
+                        if v[5] == asset_id:
+                            if v[4] != None and v[4] > latest_date:
+                                latest_date = v[4]
+                                most_recent_wo_globalid = k
+                            elif v[4] == None:
+                                most_recent_wo_globalid = k
+                    most_recent_wo = work_orders_tbl.query("GlobalID = '{}'".format(most_recent_wo_globalid)).features[0].attributes
 
-                    if len(assets.attachments.get_list(oid = obj_id)) > 0:
-                        with tempfile.TemporaryDirectory() as dirpath:
-                            try:
-                                print('Downloading attachments...')
-                                paths = assets.attachments.download(oid = obj_id, save_path = dirpath)
+                    printLog("Most recent work order row Asset ID: {0} has GlobalID: {1}".format(asset_id,most_recent_wo_globalid))
+
+                    if last_insp != None and most_recent_wo['created_date'] <= last_insp:
+                        # due date set, work order point exists, work order table row exists, and work order table row is outdated
+
+                        print('Work order is older than existing work order point...')
+                            
+                        print('Calculating days till due...')
+                        days_till_due = ((next_insp_date-today).days) + 1
+
+                        if days_till_due <= 60 and days_till_due >= 0:
+                            # if the due date within a month's time (~ 40 days), edit work order and add to upcoming in Excel
+
+                            print('Adding to upcoming dictionary...')
+                            wb_upcoming[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, last_insp_format, insp_interval, asset_id]
+                            
+                            # update AssignmentStatus as 'Assigned' in existing work order point
+                            wo_edit = {'attributes':{}}
+                            wo_edit['attributes']['AssignmentStatus'] = "Assigned"
+                            wo_edit['attributes']['NextInspection'] = next_insp
+                            wo_edit['attributes']['LastInspect'] = last_insp
+                            wo_edit['attributes']['Clock'] = insp_clock
+                            wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
+                            try:      
+                                printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                                work_orders_lyr.edit_features(updates=[wo_edit])
                             except Exception as e:
-                                print('Failed to download attachment from Hazard ID {0}, Asset OID {1}'.format(str(hazard_id), str(obj_id)))
+                                printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
                                 print(e)
-                            for path in paths:
-                                try:
-                                    print('Adding attachments...')
-                                    work_orders.attachments.add(oid = new_oid, file_path = path)
-                                except Exception as e:
-                                    print('Failed to upload attachments for Hazard ID {0}, Work Order OID {1}'.format(str(hazard_id), str(new_oid)))
 
-            else:
-                # due date set and a work order exists
-                if op_work_order_dict[hazard_id][4] == 'Completed': # and op_work_order_dict[hazard_id][1] != None
-                    print('OP work order is complete...')
+                        elif days_till_due < 0:
+                            # if the due date within a month's time (~ 40 days), edit work order and add to upcoming in Excel
 
-                    duedate = datetime.fromtimestamp(op_next_insp/1000)
+                            # record work order as overdue in Excel
+                            days_overdue = abs(days_till_due)
+                            print('Adding to overdue dictionary...')
+                            wb_overdue[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, days_overdue, last_insp_format, insp_interval, asset_id] 
+                                            
+                            # update AssignmentStatus as 'Overdue' in existing work order point
+                            print('Updating the status to "Overdue" in Work Order point...')
+                            wo_edit = {'attributes':{}}
+                            wo_edit['attributes']['AssignmentStatus'] = "Overdue"
+                            wo_edit['attributes']['NextInspection'] = next_insp_date
+                            wo_edit['attributes']['LastInspect'] = last_insp
+                            wo_edit['attributes']['Clock'] = insp_clock
+                            wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
+                            try:      
+                                printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                                work_orders_lyr.edit_features(updates=[wo_edit])
+                            except Exception as e:
+                                printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
+                                print(e)
 
-                    # record work order as complete in Excel
-                    print('Formatting complete date...')
-                    complete_date_agol = op_work_order_dict[hazard_id][1]
-                    complete_date = datetime.fromtimestamp(complete_date_agol/1000)
-                    complete_date_format = complete_date.strftime("%Y-%m-%d %H:%M:%S")
-
-                    worker = op_work_order_dict[hazard_id][2]
-
-                    print('Adding to completed dictionary...')
-                    op_completed[hazard_id] = [area, location, desc, notes, complete_date_format, worker, hazard_id, prod_acc, op_type]
-
-                    print('Calculating the next due date and the days till due...')
-                    next_due_date_agol = op_next_insp + (op_freq*86400000)
-                    next_due_date = datetime.fromtimestamp(next_due_date_agol/1000)
-                    days_till_due = (next_due_date - duedate).days
-
-                    # if next inspection date is within 40 days 
-                    # create new work order with Assigned status
-                    # add to upcoming in Excel
-                    if days_till_due <= 40:
-                        print('Creating new OP work order...')
-
-                        # add to upcoming in Excel
+                    elif last_insp == None or most_recent_wo['created_date'] > last_insp:
+                        # due date set, work order point exists, and a recent work order exists 
+                        
+                        # Calculate and format dates
+                        next_due_date = datetime.fromtimestamp((most_recent_wo['created_date'] + insp_interval_dict[insp_interval])/1000) if insp_interval in insp_interval_dict else next_insp
+                        if insp_interval == 'End of Month':
+                            next_month = next_due_date.replace(day=28) + timedelta(days=4)
+                            next_due_date = next_month - timedelta(days=next_month.day)
                         next_due_date_format = next_due_date.strftime("%Y-%m-%d %H:%M:%S")
-                        if op_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(op_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to upcoming dictionary...')
-                        op_upcoming[hazard_id] = [area, location, desc, notes, next_due_date_format, op_freq, last_insp_format,
-                                                    hazard_id, prod_acc, op_type]
+                        completed_date = datetime.fromtimestamp(most_recent_wo['created_date']/1000)
+                        completed_date_format = completed_date.strftime("%Y-%m-%d %H:%M:%S")
 
-                        # create work order as Assigned
-                        add_dict = {'geometry': geom, 
-                                    'attributes': {'username': op_type_dict[op_type][1],
-                                                'AssignmentStatus': 'Assigned',
-                                                'AssignmentType': op_type_dict[op_type][0],
-                                                'AssignmentDueDate': next_due_date_agol,
-                                                'AssetArea': area, 
-                                                'AssetLocation': location,
-                                                'AssetDescription': desc,
-                                                'AssetDescriptionNotes': notes,
-                                                'HazardID': hazard_id}}
-
-                        # create new work order with same geometry as asset
+                        # Edit work order point as "Completed"
+                        wo_edit = {'attributes':{}}
+                        wo_excluded_fields = []
+                        for k, v in most_recent_wo.items():
+                            if k not in wo_excluded_fields:
+                                wo_edit['attributes'][k] = v
+                        wo_edit['attributes']['AssignmentStatus'] = "Completed"
+                        wo_edit['attributes']['NextInspection'] = next_due_date
+                        wo_edit['attributes']['LastInspect'] = most_recent_wo['created_date']
+                        wo_edit['attributes']['Clock'] = most_recent_wo['Clock']
+                        wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
                         try:      
-                            printLog('Adding new work order...Hazard ID {}'.format(hazard_id))
-                            work_orders.edit_features(adds = [add_dict])
+                            printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                            work_orders_lyr.edit_features(updates=[wo_edit])
                         except Exception as e:
-                            printLog('Failed to add new work order for Hazard ID {}'.format(str(hazard_id)))
+                            printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
                             print(e)
 
-                        # add attachments
-                        new_work_order = work_orders.query('HazardID = {0} AND AssignmentDueDate = {1}'.format(hazard_id, next_due_date_agol)).features[0]
-                        new_oid = new_work_order.attributes['OBJECTID']
+                        # Edit asset fields
+                        asset_edit = {'attributes':{}}
+                        asset_edit['attributes']['NextInspection'] = next_due_date
+                        asset_edit['attributes']['LastInspect'] = most_recent_wo['created_date']
+                        asset_edit['attributes']['InspectName'] = most_recent_wo['InspectName']
+                        asset_edit['Clock'] = most_recent_wo['Clock']
+                        asset_edit['attributes']['OBJECTID'] = obj_id
+                        try:      
+                            printLog('Editing asset...Asset ID {}'.format(asset_id))
+                            asset_lyr.edit_features(updates=[asset_edit])
+                        except Exception as e:
+                            printLog('Failed to edit asset for Asset ID {}'.format(str(asset_id)))
+                            print(e)
 
-                        if len(assets.attachments.get_list(oid = obj_id)) > 0:
+                        # record work order as complete in Excel
+                        print('Adding to completed dictionary...')
+                        wb_completed[asset_id] = [area, building, asset_type, notes, most_recent_wo["Clock"], completed_date_format, next_due_date_format, insp_interval, asset_id]
+
+                        # add attachments from work order table to work order point
+                        wo_tbl_oid = most_recent_wo['OBJECTID']
+                        wo_oid = work_orders_dict[asset_id][7]
+                        if len(work_orders_tbl.attachments.get_list(oid = wo_tbl_oid)) > 0:
                             with tempfile.TemporaryDirectory() as dirpath:
                                 try:
                                     print('Downloading attachments...')
-                                    paths = assets.attachments.download(oid = obj_id, save_path = dirpath)
+                                    paths = work_orders_tbl.attachments.download(oid = wo_tbl_oid, save_path = dirpath)
                                 except Exception as e:
-                                    printLog('Failed to download attachment from Hazard ID {0}, Asset OID {1}'.format(str(hazard_id), str(obj_id)))
+                                    printLog('Failed to download attachment from work order table with Asset ID {0}, Asset OID {1}'.format(str(asset_id), str(wo_tbl_oid)))
                                     printLog(e)
                                 for path in paths:
                                     try:
                                         print('Adding attachments...')
-                                        work_orders.attachments.add(oid = new_oid, file_path = path)
+                                        work_orders_lyr.attachments.add(oid = wo_oid, file_path = path)
                                     except Exception as e:
-                                        printLog('Failed to upload attachments for Hazard ID {0}, Work Order OID {1}'.format(str(hazard_id), str(new_oid)))
+                                        printLog('Failed to upload attachments for work order point with Asset ID {0}, Work Order OID {1}'.format(str(asset_id), str(wo_oid)))
+            
+                elif asset_id not in wo_table_dict_assetids:
+                    # due date set, work order point exists, and work order row doesn't exist
 
-                        # update LastOpInspect and NextOpInspect with CompleteDate and new AssignmentDueDate
-                        print('Updating the last and next inspection dates in Assets...')
-                        asset_edit = (assets.query('HazardID = {}'.format(hazard_id))).features[0]
-                        asset_edit.attributes['LastOpInspect'] = complete_date_agol
-                        asset_edit.attributes['NextOpInspect'] = next_due_date_agol
-                        assets.edit_features(updates = [asset_edit])
+                        print('Work order not created for existing work order point...')
+                            
+                        print('Calculating days till due...')
+                        days_till_due = ((next_insp_date-today).days) + 1
 
-                    else:
-                        # work order is not within 40 days
-                        complete_date_agol = op_work_order_dict[hazard_id][1]
-                        next_due_date_agol = op_next_insp + (op_freq*86400000)
+                        if days_till_due <= 60 and days_till_due >= 0:
+                            # if the due date within a month's time (~ 40 days), edit work order and add to upcoming in Excel
 
-                        # update LastOpInspect and NextOpInspect with CompleteDate and new AssignmentDueDate
-                        print('Upadting the last and next inspection dates in Assets...')
-                        asset_edit = (assets.query('HazardID = {}'.format(hazard_id))).features[0]
-                        asset_edit.attributes['LastOpInspect'] = complete_date_agol
-                        asset_edit.attributes['NextOpInspect'] = next_due_date_agol
-                        assets.edit_features(updates = [asset_edit])
-
-                else:
-                    wo_obj_id = op_work_order_dict[hazard_id][5]
-
-                    orig_duedate = op_work_order_dict[hazard_id][3]
-                    duedate = datetime.fromtimestamp(orig_duedate/1000)
-                    duedate_format = duedate.strftime("%Y-%m-%d %H:%M:%S")
-
-                    if duedate < today:
-                        print('OP work order is overdue...')
-
-                        print('Calculating the days overdue...')
-                        days_overdue = (today - duedate).days
-
-                        # record work order as overdue in Excel
-                        if op_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(op_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to overdue dictionary...')
-                        op_overdue[hazard_id] = [duedate_format, days_overdue, area, location, desc, notes, op_freq, 
-                                                last_insp_format, hazard_id, prod_acc, op_type] 
-                                        
-                        # update AssignmentStatus as Overdue in existing work order
-                        print('Updating the status to overdue in Work Orders...')
-                        work_order_edit = (work_orders.query('OBJECTID = {}'.format(wo_obj_id))).features[0]
-                        work_order_edit.attributes['AssignmentStatus'] = 'Overdue'
-                        work_orders.edit_features(updates = [work_order_edit])
-
-                    else:
-                        print('OP work order is upcoming...')
-
-                        # record work order as upcoming in Excel
-                        if op_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(op_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to upcoming dictionary...')
-                        op_upcoming[hazard_id] = [area, location, desc, notes, duedate_format, op_freq, last_insp_format, 
-                                                    hazard_id, prod_acc, op_type]
-
-    # ---------------------------------------------------------------------------------------------------------------------------
-
-        # PE
-        if pe_next_insp != None:
-            if hazard_id not in pe_work_order_dict.keys():
-                print('Due date set and no work order is scheduled')
-                duedate = datetime.fromtimestamp(pe_next_insp/1000)
-
-                # if the due date within a year's time (~ 375 days), create workorder and record as upcoming
-                print('Calculating days till due...')
-
-                days_till_due = (today - duedate).days
-                if days_till_due <= 375:
-                    print('Creating new PE work order...')
-
-                    # record work order as upcoming in Excel
-                    duedate_format = duedate.strftime("%Y-%m-%d %H:%M:%S")
-                    if pe_last_insp != None:
-                        last_insp_format = (datetime.fromtimestamp(pe_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                        last_insp_format = 'No previous inspection'
-                    print('Adding to upcoming dictionary...')
-                    pe_upcoming[hazard_id] = [area, location, desc, notes, duedate_format, pe_freq, last_insp_format, 
-                                                hazard_id, prod_acc]
-
-                    # create work order as Assigned
-                    add_dict = {'geometry': geom, 
-                                'attributes': {'AssignmentStatus': 'Assigned',
-                                                'AssignmentType': 'PE Inspection',
-                                                'AssignmentDueDate': pe_next_insp,
-                                                'AssetArea': area, 
-                                                'AssetLocation': location,
-                                                'AssetDescription': desc,
-                                                'AssetDescriptionNotes': notes,
-                                                'HazardID': hazard_id}}
-
-                    # create new work order with same geometry as asset
-                    try:      
-                        print('Adding new PE work order...Hazard ID {}'.format(hazard_id))
-                        work_orders.edit_features(adds = [add_dict])
-                    except Exception as e:
-                        print('Failed to add new work order for Hazard ID {}'.format(str(hazard_id)))
-                        print(e)
-                    # adds_l.append(add_dict)
-
-                    # add attachments
-                    new_work_order = work_orders.query('HazardID = {}'.format(hazard_id)).features[0]
-                    new_oid = new_work_order.attributes['OBJECTID']
-
-                    if len(assets.attachments.get_list(oid = obj_id)) > 0:
-                        with tempfile.TemporaryDirectory() as dirpath:
-                            try:
-                                print('Downloading attachments...')
-                                paths = assets.attachments.download(oid = obj_id, save_path = dirpath)
+                            print('Adding to upcoming dictionary...')
+                            wb_upcoming[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, last_insp_format, insp_interval, asset_id]
+                            
+                            # update AssignmentStatus as 'Assigned' in existing work order point
+                            wo_edit = {'attributes':{}}
+                            wo_edit['attributes']['AssignmentStatus'] = "Assigned"
+                            wo_edit['attributes']['NextInspection'] = next_insp_date
+                            wo_edit['attributes']['LastInspect'] = last_insp
+                            wo_edit['attributes']['Clock'] = insp_clock
+                            wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
+                            try:      
+                                printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                                work_orders_lyr.edit_features(updates=[wo_edit])
                             except Exception as e:
-                                print('Failed to download attachment from Hazard ID {0}, Asset OID {1}'.format(str(hazard_id), str(obj_id)))
+                                printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
                                 print(e)
-                            for path in paths:
-                                try:
-                                    print('Adding attachments...')
-                                    work_orders.attachments.add(oid = new_oid, file_path = path)
-                                except Exception as e:
-                                    print('Failed to upload attachments for Hazard ID {0}, Work Order OID {1}'.format(str(hazard_id), str(new_oid)))
 
-            else:
-                # due date set and a work order exists
-                if pe_work_order_dict[hazard_id][4] == 'Completed': # and pe_work_order_dict[hazard_id][1] != None
-                    print('PE work order is complete...')
+                        elif days_till_due < 0:
+                            # if the due date within a month's time (~ 40 days), edit work order and add to upcoming in Excel
 
-                    # work order is completed
-                    duedate = datetime.fromtimestamp(pe_next_insp/1000)
+                            # record work order as overdue in Excel
+                            days_overdue = abs(days_till_due)
+                            print('Adding to overdue dictionary...')
+                            wb_overdue[asset_id] = [area, building, asset_type, notes, insp_clock, next_insp_format, days_overdue, last_insp_format, insp_interval, asset_id] 
+                                            
+                            # update AssignmentStatus as 'Overdue' in existing work order point
+                            print('Updating the status to "Overdue" in Work Order point...')
+                            wo_edit = {'attributes':{}}
+                            wo_edit['attributes']['AssignmentStatus'] = "Overdue"
+                            wo_edit['attributes']['NextInspection'] = next_insp_date
+                            wo_edit['attributes']['LastInspect'] = last_insp
+                            wo_edit['attributes']['Clock'] = insp_clock
+                            wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
+                            try:      
+                                printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                                work_orders_lyr.edit_features(updates=[wo_edit])
+                            except Exception as e:
+                                printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
+                                print(e)
+                        
+                        elif days_till_due > 60:
+                            # due date over one month away
+                            
+                            # copy asset point attributes to work order point
+                            print('Updating the status to "Overdue" in Work Order point...')
+                            wo_edit = {'attributes':{}}
+                            wo_edit['attributes']['NextInspection'] = next_insp_date
+                            wo_edit['attributes']['LastInspect'] = last_insp
+                            wo_edit['attributes']['Clock'] = insp_clock
+                            wo_edit['attributes']['OBJECTID'] = work_orders_dict[asset_id][7]
+                            try:      
+                                printLog('Editing work order point...Asset ID {}'.format(asset_id))
+                                work_orders_lyr.edit_features(updates=[wo_edit])
+                            except Exception as e:
+                                printLog('Failed to edit work order point for Asset ID {}'.format(str(asset_id)))
+                                print(e)
 
-                    # record work order as complete in Excel
-                    print('Formatting complete date...')
-                    complete_date_agol = pe_work_order_dict[hazard_id][1]
-                    complete_date = datetime.fromtimestamp(complete_date_agol/1000)
-                    complete_date_format = complete_date.strftime("%Y-%m-%d %H:%M:%S")
-
-                    worker = pe_work_order_dict[hazard_id][2]
-
-                    print('Adding to completed dictionary...')
-                    pe_completed[hazard_id] = [area, location, desc, notes, complete_date_format, worker, hazard_id, prod_acc]
-
-                    # calculate next inspection date with frequency
-                    print('Calculating next due date and days till due...')
-                    next_due_date_agol = pe_next_insp + (pe_freq*86400000)
-                    next_due_date = datetime.fromtimestamp(next_due_date_agol/1000)
-                    days_till_due = (next_due_date - duedate).days
-
-                    # if next inspection date is within a year and 10 days 
-                    # create new work order with Assigned status
-                    # add to upcoming in Excel
-                    if days_till_due <= 375:
-                        print('Creating new PE work order...')
-
-                        # add to upcoming in Excel
-                        next_due_date_format = next_due_date.strftime("%Y-%m-%d %H:%M:%S")
-                        if pe_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(pe_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to upcoming dictionary...')
-                        pe_upcoming[hazard_id] = [area, location, desc, notes, next_due_date_format, pe_freq, last_insp_format,
-                                                    hazard_id, prod_acc]
-
-                        # create work order as Assigned
-                        add_dict = {'geometry': geom, 
-                                    'attributes': {'AssignmentStatus': 'Assigned',
-                                                'AssignmentType': 'PE Inspection',
-                                                'AssignmentDueDate': next_due_date_agol,
-                                                'AssetArea': area, 
-                                                'AssetLocation': location,
-                                                'AssetDescription': desc,
-                                                'AssetDescriptionNotes': notes,
-                                                'HazardID': hazard_id}}
-
-                        # create new work order with same geometry as asset
-                        try:      
-                            print('Adding new PE work order...Hazard ID {}'.format(hazard_id))
-                            work_orders.edit_features(adds = [add_dict])
-                        except Exception as e:
-                            print('Failed to add new work order for Hazard ID {}'.format(str(hazard_id)))
-                            print(e)
-
-                        # add attachments
-                        new_work_order = work_orders.query('HazardID = {0} AND AssignmentDueDate = {1}'.format(hazard_id, next_due_date_agol)).features[0]
-                        new_oid = new_work_order.attributes['OBJECTID']
-
-                        if len(assets.attachments.get_list(oid = obj_id)) > 0:
-                            with tempfile.TemporaryDirectory() as dirpath:
-                                try:
-                                    print('Downloading attachments...')
-                                    paths = assets.attachments.download(oid = obj_id, save_path = dirpath)
-                                except Exception as e:
-                                    print('Failed to download attachment from Hazard ID {0}, Asset OID {1}'.format(str(hazard_id), str(obj_id)))
-                                    print(e)
-                                for path in paths:
-                                    try:
-                                        print('Adding attachments...')
-                                        work_orders.attachments.add(oid = new_oid, file_path = path)
-                                    except Exception as e:
-                                        print('Failed to upload attachments for Hazard ID {0}, Work Order OID {1}'.format(str(hazard_id), str(new_oid)))
-
-                        # update InspectDate and NextpeInspect with CompleteDate and new AssignmentDueDate
-                        print('Updating last and next inspection dates in Assets...')
-                        asset_edit = (assets.query('HazardID = {}'.format(hazard_id))).features[0]
-                        asset_edit.attributes['InspectDate'] = complete_date_agol
-                        asset_edit.attributes['NextPEInspect'] = next_due_date_agol
-                        assets.edit_features(updates = [asset_edit])
-
-                    else:
-                        # work order is not within 40 days
-                        complete_date_agol = pe_work_order_dict[hazard_id][1]
-                        next_due_date_agol = pe_next_insp + (pe_freq*86400000)
-
-                        # update InspectDate and NextPEInspect with CompleteDate and new AssignmentDueDate
-                        print('Updating last and next inspection dates in Assets...')
-                        asset_edit = (assets.query('HazardID = {}'.format(hazard_id))).features[0]
-                        asset_edit.attributes['InspectDate'] = complete_date_agol
-                        asset_edit.attributes['NextPEInspect'] = next_due_date_agol
-                        assets.edit_features(updates = [asset_edit])
-
-                else:
-                    wo_obj_id = pe_work_order_dict[hazard_id][5]
-
-                    orig_duedate = pe_work_order_dict[hazard_id][3]
-                    duedate = datetime.fromtimestamp(orig_duedate/1000)
-                    duedate_format = duedate.strftime("%Y-%m-%d %H:%M:%S")
-
-                    if duedate < today:
-                        print('PE work order is overdue...')
-
-                        print('Calculating days overdue...')
-                        days_overdue = (today - duedate).days
-
-                        # record work order as overdue in Excel
-                        if pe_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(pe_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to overdue dictionary...')
-                        pe_overdue[hazard_id] = [duedate_format, days_overdue, area, location, desc, notes, pe_freq, last_insp_format, hazard_id, prod_acc] 
-                                        
-                        # update AssignmentStatus as Overdue in existing work order
-                        print('Updating status to overdue...')
-                        work_order_edit = (work_orders.query('OBJECTID = {}'.format(wo_obj_id))).features[0]
-                        work_order_edit.attributes['AssignmentStatus'] = 'Overdue'
-                        work_orders.edit_features(updates = [work_order_edit])
-
-                    else:
-                        print('PE work order is upcoming...')
-                        # record work order as upcoming in Excel
-                        if pe_last_insp != None:
-                            last_insp_format = (datetime.fromtimestamp(pe_last_insp/1000)).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            last_insp_format = 'No previous inspection'
-                        print('Adding to upcoming dictionary...')
-                        pe_upcoming[hazard_id] = [area, location, desc, notes, duedate_format, pe_freq, last_insp_format, 
-                                                    hazard_id, prod_acc]
-
-    printLog('{} Operator inspections are upcoming...'.format(str(len(op_upcoming))))
-    printLog('{} Operator inspections are complete...'.format(str(len(op_completed))))
-    printLog('{} Operator inspections are overdue...'.format(str(len(op_overdue))))
-    printLog('{} PE inspections are upcoming...'.format(str(len(pe_upcoming))))
-    printLog('{} PE inspections are complete...'.format(str(len(pe_completed))))
-    printLog('{} PE inspections are overdue...'.format(str(len(pe_overdue))))
-
-    return(op_upcoming, op_completed, op_overdue, pe_upcoming, pe_completed, pe_overdue)
+        # Assign excel worksheets
+        if asset_name_dict[asset_type] == 0:
+            if asset_id in wb_overdue:
+                crane_overdue[asset_id] = wb_overdue[asset_id]
+            elif asset_id in wb_completed:
+                crane_completed[asset_id] = wb_completed[asset_id]
+            elif asset_id in wb_upcoming:
+                crane_upcoming[asset_id] = wb_upcoming[asset_id]
+        elif asset_name_dict[asset_type] == 1:
+            if asset_id in wb_overdue:
+                fire_overdue[asset_id] = wb_overdue[asset_id]
+            elif asset_id in wb_completed:
+                fire_completed[asset_id] = wb_completed[asset_id]
+            elif asset_id in wb_upcoming:
+                fire_upcoming[asset_id] = wb_upcoming[asset_id]
+        elif asset_name_dict[asset_type] == 2:
+            if asset_id in wb_overdue:
+                eyewash_overdue[asset_id] = wb_overdue[asset_id]
+            elif asset_id in wb_completed:
+                eyewash_completed[asset_id] = wb_completed[asset_id]
+            elif asset_id in wb_upcoming:
+                eyewash_upcoming[asset_id] = wb_upcoming[asset_id]
+        elif asset_name_dict[asset_type] == 3:
+            if asset_id in wb_overdue:
+                forktruck_overdue[asset_id] = wb_overdue[asset_id]
+            elif asset_id in wb_completed:
+                forktruck_completed[asset_id] = wb_completed[asset_id]
+            elif asset_id in wb_upcoming:
+                forktruck_upcoming[asset_id] = wb_upcoming[asset_id]
 
 
-def moveToListService(portal, un, pw, item_id, wo_index, list_index):
+# ---------------------------------------------------------------------------------------------------------------------------
+    printLog('{} inspections are upcoming...'.format(str(len(wb_upcoming))))
+    printLog('{} inspections are complete...'.format(str(len(wb_completed))))
+    printLog('{} inspections are overdue...'.format(str(len(wb_overdue))))
+    
+    return(wb_upcoming, wb_completed, wb_overdue, \
+            crane_upcoming, crane_completed, crane_overdue,
+            forktruck_upcoming, forktruck_completed, forktruck_overdue,
+            eyewash_upcoming, eyewash_completed, eyewash_overdue,
+            fire_upcoming, fire_completed, fire_overdue)
 
-    gis = GIS(portal, un, pw)
+def moveToListService(orgURL, username, password, itemID, wo_index, list_index):
+
+    gis = GIS(orgURL, username, password)
     printLog('Connected to Portal as {}'.format(gis.properties['user']['username']))
 
     printLog('Grabbing feature services...')
-    sdi_item = gis.content.get(item_id)
+    sdi_item = gis.content.get(itemID)
     work_orders_lyr = sdi_item.layers[wo_index]
     list_lyr = sdi_item.layers[list_index]
 
@@ -685,26 +580,26 @@ def moveToListService(portal, un, pw, item_id, wo_index, list_index):
     printLog('Copying work orders...')
     copy_feat = [f for f in work_orders_feat]
     printLog('Constructing deletion list...')
-    del_feat = [f.attributes['OBJECTID'] for f in list_feat]
+    del_feat = [f.attributes['OBJECTID'] for f in list_feat]       
 
     print('Updating the XY of work orders before copying over...')
     for feat in copy_feat:
-
         feat.geometry['x'] = -9453433.93 
         feat.geometry['y'] = 5067414.83 
 
-    print('Deleting all rows from list...')
-    list_lyr.edit_features(deletes = del_feat)
+    if len(del_feat) > 0:
+        print('Deleting all rows from list...')
+        list_lyr.edit_features(deletes = del_feat)
+
     print('Appending updated work orders...')
     list_lyr.edit_features(adds = copy_feat)
-
 
 def cleanUp(archive_fldr, wb_path):
     '''Moves workbook to archived folder. '''
 
     wb_name = path.basename(wb_path)
 
-    printLog('moving workbook to archived...')
+    printLog('Moving workbook to archived...')
     shutil.move(wb_path, archive_fldr + r'\{}'.format(wb_name))
 
     printLog('Successfully moved to "archived"!')
@@ -718,17 +613,17 @@ def cleanUp(archive_fldr, wb_path):
 
         if oldestxlsx != archive_fldr + r'\{}'.format(wb_name):
             os.remove(oldestxlsx)
-
-
+#%%
 if __name__ == "__main__":
 
     # ------------------------------------------ maintain log file ------------------------------------------
-    current = datetime.now()
-    logfile = (path.abspath(path.join(path.dirname(__file__), '..', r'logs\asset-workorder-updates-ljb-LOG_{0}_{1}.txt'.format(current.month, current.year))))
+    today = datetime.now()
+    logfile = (path.abspath(path.join(path.dirname(__file__), '..', r'logs\asset-workorder-updates-ljb-LOG_{0}_{1}.txt'.format(today.month, today.year))))
     logging.basicConfig(filename=logfile,
                         level=logging.INFO,
                         format='%(levelname)s: %(asctime)s %(message)s',
                         datefmt='%m/%d/%Y %I:%M:%S')
+
     printLog("Starting run... \n")
 
     # ------------------------------------------ local inputs  ------------------------------------------
@@ -749,9 +644,14 @@ if __name__ == "__main__":
     password = json_ago['password']
     # Item ID to WWS Assets and Work Order service
     itemID = json_ago["itemid"]
-    asset_index = json_ago["assetindex"]
+    #asset_list = json_ago["assetindex"]
+    wo_table_index = json_ago["tableindex"]
     wo_index = json_ago["workorderindex"]
     list_index = json_ago["listindex"]
+    crane_index = json_ago["craneindex"]
+    forktruck_index = json_ago["forktruckindex"]
+    eyewash_index = json_ago["eyewashindex"]
+    fire_index = json_ago["fireindex"]
 
     # ------------------------------------------ get email creds ------------------------------------------
     email_text = open(workingfldr + r'\email-info.json').read()
@@ -764,56 +664,54 @@ if __name__ == "__main__":
     email_message = json_email['message']
 
     # ------------------------------------------ excel workbook columns ------------------------------------
-    op_complete_cols = [['A1','Area'],['B1', 'Location'],['C1', 'Description'],['D1', 'Asset Description Notes'],
-                        ['E1', 'Completion Date'],['F1', 'Who Completed Inspection'],['G1', 'Asset ID of Hazard'],
-                        ['H1', 'Production Accessible'],['I1', 'Type (Crane or WWS)']]
 
-    pe_complete_cols = [['A1','Area'],['B1', 'Location'],['C1', 'Description'],['D1', 'Asset Description Notes'],
-                        ['E1', 'Completion Date'],['F1', 'Who Completed Inspection'],['G1', 'Asset ID of Hazard'],
-                        ['H1', 'Production Accessible']]
+    # "Completed" column names
+    wb_complete_cols = [['A1', 'Area'],['B1', 'Building'],['C1', 'Equipment Type'], ['D1', 'Notes'],['E1', 'Inspector Clock'],['F1', 'Completed Date'],['G1', 'Next Inspection Date'],['H1', 'Inspection Interval'],['I1', 'Asset ID']]
 
-    op_upcoming_cols = [['A1', 'Area'],['B1', 'Location '],['C1', 'Description'],['D1', 'Asset Description Notes'],
-                        ['E1', 'Due Date'],['F1', 'Frequency of Inspection'],['G1', 'Last Inspection Date'],
-                        ['H1', 'Asset ID (Hazard  ID)'],['I1', 'Production Accessible'],['J1', 'Type (Crane or WWS)']]
+    # "Upcoming" column names
+    wb_upcoming_cols = [['A1', 'Area'],['B1', 'Building'],['C1', 'Equipment Type'],['D1', 'Notes'],['E1', 'Inspector Clock'],['F1', 'Next Inspection Date'],['G1', 'Last Inspection Date'],['H1', 'Inspection Interval'],['I1', 'Asset ID']]
 
-    pe_upcoming_cols = [['A1', 'Area'],['B1', 'Location '],['C1', 'Description'],['D1', 'Asset Description Notes'],
-                        ['E1', 'Due Date'],['F1', 'Frequency of Inspection'],['G1', 'Last Inspection Date'],
-                        ['H1', 'Asset ID (Hazard  ID)'],['I1', 'Production Accessible']]
+    # "Overdue" column names
+    wb_overdue_cols = [['A1', 'Area'],['B1', 'Building'],['C1', 'Equipment Type'],['D1', 'Notes'],['E1', 'Inspector Clock'],['F1', 'Duedate'],['G1', 'Days Overdue'],['H1', 'Last Inspection Date'],['I1', 'Inspection Interval'],['J1', 'Asset ID']]
 
-    op_overdue_cols = [['A1','Original Due Date'],['B1', 'Days Overdue'],['C1', 'Area'],['D1', 'Location'],
-                        ['E1', 'Description'],['F1', 'Asset Description Notes'],['G1', 'Frequency'],
-                        ['H1', 'Last Inspected Date'],['I1', 'Asset ID of Hazard'],['J1', 'Production Accessible'],
-                        ['K1', 'Type (Crane or WWS)']]
-
-    pe_overdue_cols = [['A1','Original Due Date'],['B1', 'Days Overdue'],['C1', 'Area'],['D1', 'Location'],
-                        ['E1', 'Description'],['F1', 'Asset Description Notes'],['G1', 'Frequency'],
-                        ['H1', 'Last Inspected Date'],['I1', 'Asset ID of Hazard'],['J1', 'Production Accessible']]  
-    
+#%%
     # ------------------------------------------ execute functions ------------------------------------------
+
     try: 
         printLog('Grabbing services and sorting data...')
-        asset, work_orders, asset_dict, \
-            op_work_order_dict, pe_work_order_dict = buildQueryDictionaries(orgURL, username, password, itemID, asset_index, wo_index)
+        asset_lyrs, asset_list, work_orders_lyr, work_orders_tbl, asset_dict, wo_table_dict, work_orders_dict = buildQueryDictionaries(orgURL, username, password, itemID, \
+                                                            wo_table_index, wo_index, crane_index, 
+                                                            forktruck_index, eyewash_index, fire_index)
         printLog('Updating assets and work orders...')
-        op_upcom, op_com, op_overdue, \
-            pe_upcom, pe_com, pe_overdue = updateServices(asset, work_orders, asset_dict, op_work_order_dict, pe_work_order_dict, current)
+        wb_upcoming, wb_completed, wb_overdue, crane_upcom, crane_com, crane_overdue, forktruck_upcom, forktruck_com, forktruck_overdue, eyewash_upcom, eyewash_com, eyewash_overdue, fire_upcom, fire_com, fire_overdue = updateServices(asset_lyrs, asset_list, work_orders_lyr, work_orders_tbl, asset_dict, wo_table_dict, work_orders_dict, today)
+        
         printLog('Moving work orders to list...')
         moveToListService(orgURL, username, password, itemID, wo_index, list_index)
 
-        worksheet_dict = {'Operator Completed': [op_com, op_complete_cols], 
-                        'PE Completed': [pe_com, pe_complete_cols],
-                        'Operator Upcoming': [op_upcom, op_upcoming_cols],
-                        'PE Upcoming': [pe_upcom, pe_upcoming_cols],
-                        'Operator Overdue': [op_overdue, op_overdue_cols], 
-                        'PE Overdue': [pe_overdue, pe_overdue_cols]}
+        worksheet_dict = {'Fire Extinguisher Completed': [fire_com, wb_complete_cols],
+                        'Eyewash Completed': [eyewash_com, wb_complete_cols],
+                        'Crane Completed': [crane_com, wb_complete_cols],
+                        'Fork Truck Completed': [forktruck_com, wb_complete_cols],
+                        'Fire Extinguisher Upcoming': [fire_upcom, wb_upcoming_cols],
+                        'Eyewash Upcoming': [eyewash_upcom, wb_upcoming_cols],
+                        'Crane Upcoming': [crane_upcom, wb_upcoming_cols],
+                        'Fork Truck Upcoming': [forktruck_upcom, wb_upcoming_cols],
+                        'Fire Extinguisher Overdue': [fire_overdue, wb_overdue_cols],
+                        'Eyewash Overdue': [eyewash_overdue, wb_overdue_cols],
+                        'Fork Truck Overdue': [forktruck_overdue, wb_overdue_cols],
+                        'Crane Overdue': [crane_overdue, wb_overdue_cols]}
+        
         printLog('Creating Excel workbook...')
         wb, wb_path = createWorkbook(workingfldr)
         printLog('Populating worksheets...')
         addWorksheet(wb, worksheet_dict)
         wb.close()
 
-        printLog('Sendning e-mail...')
-        sendemail(email_recipient, email_from, email_subject, email_message, email_cc, att=wb_path)
+        if today.weekday() == 0:
+            printLog('Sending e-mail...')
+            sendemail(email_recipient, email_from, email_subject, email_message, email_cc, att=wb_path)
+        else:
+            printLog('Today is not Monday, skipping email send...')
 
         printLog('Clean up, aisle 9...')
         cleanUp(archfldr, wb_path)
@@ -822,10 +720,16 @@ if __name__ == "__main__":
 
     except Exception: 
         logging.error("EXCEPTION OCCURRED", exc_info=True)
-        logging.info('Sending email to LJB staff for inspection... ')
-        email_err_subject = "SDI Caster Script Error"
-        email_err_message = "An error occurred while updating the WWS Assignments... \n" \
-                            + "See the attached log file for error message.\n" 
-        sendemail(eto=email_cc, efrom=email_from, subject=email_err_subject, message=email_err_message, att=logfile)
-        printLog("Quitting! \n ------------------------------------ \n\n")  
 
+        error_to = 'wfrancois@ljbinc.com'
+        error_from = 'WorkFlow@ljbinc.com'
+        error_sub = 'FAILED asset-workorder-updates-ljb.py'
+        error_msg = 'asset-workorder-updates-ljb.py failed. Log file is attached. Please review and contact GTG if necessary (sstokes@geotg.com or jrogers@geotg.com)'
+        printLog("Sending log to owners...")
+
+        try:
+            sendemail(error_to, error_from, error_sub, error_msg, '', att = logfile)
+        except Exception:
+            logging.error("Email exception occurred...", exc_info=True)
+            
+        printLog("Quitting! \n ------------------------------------ \n\n")  
